@@ -4,6 +4,7 @@ import hashlib
 import re
 from sklearn.linear_model import Lasso
 from scipy.optimize import lsq_linear
+from joblib import Parallel, delayed
 
 # --- Parameters ---
 num_bloombits = 2048
@@ -11,9 +12,10 @@ num_hashes = 5
 prob_p = 0.5
 prob_q = 0.75
 prob_f = 0.5
-num_views = 15
 max_url_length = 100
-lambda_lasso = 0.0001  # Alpha in sklearn's Lasso
+lambda_lasso = 0.0001
+eps = np.finfo(float).eps
+view_range = range(50, 501, 50)
 
 # --- Load and trim dataset (first 1000 rows) ---
 try:
@@ -25,26 +27,17 @@ try:
     labels = labels[:N]
 except FileNotFoundError:
     print("Error: 'PhiUSIIL_Phishing_URL_Dataset.csv' not found.")
-    print("Please ensure the dataset file is in the same directory as the script.")
-    exit() 
+    exit()
 
-# --- Helper Functions ---
 def bloom_hash(input_string, salt, num_bits):
     key = f"{input_string}_{salt}".encode('utf-8')
     md = hashlib.sha256()
     md.update(key)
     hash_bytes = md.digest()
-    # Take the first 4 bytes for consistent integer conversion with MATLAB's typecast to uint32
-    hash_num = int.from_bytes(hash_bytes[:4], 'big')
-    index = (hash_num % num_bits)
-    return index
+    return int.from_bytes(hash_bytes[:4], 'big') % num_bits
 
 def pad_string(s, maxlen):
-    s = str(s)
-    if len(s) > maxlen:
-        return s[:maxlen]
-    else:
-        return s + ' ' * (maxlen - len(s))
+    return str(s)[:maxlen].ljust(maxlen)
 
 def normalize_urls(urls):
     urls = np.array([str(url).lower() for url in urls])
@@ -52,114 +45,135 @@ def normalize_urls(urls):
     urls = np.array([re.sub(r'/$', '', url) for url in urls])
     return urls
 
-print(f"Loaded {N} URLs.")
-
-# --- Step 1: PRR Encoding ---
-print("Step 1: PRR Encoding...")
+# --- Step 1: PRR Encoding (once) ---
+print("Generating PRR matrix...")
 prr_matrix = np.zeros((N, num_bloombits), dtype=int)
 for i in range(N):
     s = pad_string(websites[i], max_url_length)
     bf = np.zeros(num_bloombits, dtype=int)
     for h in range(1, num_hashes + 1):
-        salt = f"{h}_cohort"
-        idx = bloom_hash(s, salt, num_bloombits)
+        idx = bloom_hash(s, f"{h}_cohort", num_bloombits)
         bf[idx] = 1
-    
     f_mask = np.random.rand(num_bloombits) < prob_f
     uniform = np.random.rand(num_bloombits) < 0.5
-    
     prr = (bf & ~f_mask) | (uniform & f_mask)
-    prr_matrix[i, :] = prr
+    prr_matrix[i] = prr
 
-print("PRR Encoding complete.")
-
-# --- Step 2: IRR Views ---
-print("Step 2: Generating IRR Views...")
-irr_list = [] 
-for v in range(num_views):
-    for i in range(N):
-        prr = prr_matrix[i, :]
-        p_bits = np.random.rand(num_bloombits) < prob_p
-        q_bits = np.random.rand(num_bloombits) < prob_q
-        irr = (p_bits & ~prr) | (q_bits & prr)
-        irr_list.append(irr)
-irr_matrix = np.array(irr_list)
-print("IRR Views complete.")
-
-# --- Step 3: Design Matrix for Candidates ---
-print("Step 3: Creating Design Matrix for Candidates...")
+# --- Step 2: Design Matrix (once) ---
+print("Creating design matrix...")
 candidates = np.unique(websites)
 M = len(candidates)
 A = np.zeros((M, num_bloombits), dtype=int)
 for i in range(M):
     s = pad_string(candidates[i], max_url_length)
     for h in range(1, num_hashes + 1):
-        salt = f"{h}_cohort"
-        idx = bloom_hash(s, salt, num_bloombits)
+        idx = bloom_hash(s, f"{h}_cohort", num_bloombits)
         A[i, idx] = 1
 
-print("Design Matrix complete.")
+# --- Experiment Function ---
+def run_experiment(num_views):
+    irr_all = []
+    for _ in range(num_views):
+        p_bits = np.random.rand(N, num_bloombits) < prob_p
+        q_bits = np.random.rand(N, num_bloombits) < prob_q
+        irr = (p_bits & ~prr_matrix) | (q_bits & prr_matrix)
+        irr_all.append(irr)
+    irr_matrix = np.vstack(irr_all)
 
-# --- Step 4: Frequency Reconstruction ---
-print("Step 4: Performing Frequency Reconstruction...")
-y = np.mean(irr_matrix, axis=0).reshape(-1, 1) 
-reconstructed_freq = None
-try:
-    
-    lasso_model = Lasso(alpha=lambda_lasso, fit_intercept=False, positive=True, max_iter=2000) 
-    lasso_model.fit(A.T, y.ravel())
-    reconstructed_freq = lasso_model.coef_
-    reconstructed_freq[reconstructed_freq < 1e-9] = 0
+    y = np.mean(irr_matrix, axis=0).reshape(-1, 1)
+    try:
+        model = Lasso(alpha=lambda_lasso, fit_intercept=False, positive=True, max_iter=2000)
+        model.fit(A.T, y.ravel())
+        freq = model.coef_
+        freq[freq < 1e-9] = 0
+        method = "LASSO"
+        if np.sum(freq > 0) == 0:
+            raise Exception()
+    except:
+        res = lsq_linear(A.T, y.ravel(), bounds=(0, np.inf), method='trf')
+        freq = res.x
+        method = "lsqnonneg"
 
-    print(f'Used LASSO: {np.sum(reconstructed_freq > 0)} non-zero coefficients')
-    if np.sum(reconstructed_freq > 0) == 0:
-        raise Exception('Fallback to lsqnonneg')
-except Exception as e:
-    print(f"LASSO failed or had no non-zero coefficients ({e}). Falling back to lsqnonneg.")
-    res = lsq_linear(A.T, y.ravel(), bounds=(0, np.inf), method='trf')
-    reconstructed_freq = res.x
-    print(f'Used lsqnonneg: {np.sum(reconstructed_freq > 0)} non-zero coefficients')
+    threshold = 0.003
+    detected_indices = np.where(freq > threshold)[0]
+    recon_urls = candidates[detected_indices]
 
-print("Frequency Reconstruction complete.")
+    recon_clean = normalize_urls(recon_urls)
+    true_malicious = normalize_urls(websites[labels == 1])
+    recon_labels = np.isin(recon_clean, true_malicious)
 
-# --- Step 5: Detection with Normalized Matching ---
-print("\nStep 5: Detecting Phishing URLs...")
-threshold = 0.003
-detected_indices = np.where(reconstructed_freq > threshold)[0]
-recon_websites = candidates[detected_indices]
+    tp = np.sum(recon_labels)
+    fp = len(recon_labels) - tp
+    fn = np.sum(~np.isin(true_malicious, recon_clean))
 
-# Normalize both sets for string comparison
-recon_clean = normalize_urls(recon_websites)
-true_malicious = normalize_urls(websites[labels == 1])
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
 
-# Determine if reconstructed websites are actually malicious
-recon_labels = np.isin(recon_clean, true_malicious)
+    print(f"\nViews: {num_views}")
+    print(f"# Detected: {len(recon_labels)}")
+    print(f"# True phishing: {len(true_malicious)}")
+    print(f"# Matched (True Positives): {tp}")
+    print(f"Precision: {precision:.2f} | Recall: {recall:.2f} | F1-score: {f1:.2f} | Method: {method}")
 
-print('\nReconstructed Websites (label = 1 = phishing):')
-for i in range(len(recon_websites)):
-    print(f'{recon_websites[i]}\tlabel={int(recon_labels[i])}')
+    print("\nReconstructed Websites:")
+    for url, is_phishing in zip(recon_clean, recon_labels):
+        label = "phishing ✅" if is_phishing else "benign ❌"
+        print(f"- {url} [{label}]")
 
-# --- Metrics ---
-tp = np.sum(recon_labels)
-fp = len(recon_labels) - tp
-fn = np.sum(~np.isin(true_malicious, recon_clean)) # Malicious not found in reconstructed
+    return (num_views, precision, recall, f1, method)
 
-# Add a small epsilon to avoid division by zero
-eps = np.finfo(float).eps
 
-precision = tp / (tp + fp + eps)
-recall = tp / (tp + fn + eps)
-f1 = 2 * precision * recall / (precision + recall + eps)
+# --- Run All Experiments in Parallel ---
+print("\nRunning experiments in parallel...")
+results = Parallel(n_jobs=-1, backend='loky')(delayed(run_experiment)(v) for v in view_range)
 
-print(f'\n# Detected: {len(recon_websites)}')
-print(f'# True phishing: {len(true_malicious)}')
-print(f'# Matched (True Positives): {tp}')
-print(f'Precision: {precision:.2f} | Recall: {recall:.2f} | F1-score: {f1:.2f}')
+# --- Results Summary ---
+summary_df = pd.DataFrame(results, columns=["Views", "Precision", "Recall", "F1", "Method"])
+print("\n--- Summary of Results ---")
+print(summary_df.to_string(index=False))
+best_idx = summary_df['F1'].idxmax()
+best_row = summary_df.loc[best_idx]
 
-# --- Top Results ---
-# Sort by reconstructed frequency in descending order
-sorted_indices = np.argsort(reconstructed_freq)[::-1]
-print('\nTop Candidates by Estimated Frequency:')
-for i in range(min(10, len(sorted_indices))):
-    idx = sorted_indices[i]
-    print(f'{candidates[idx]}: {reconstructed_freq[idx]:.4f}')
+# --- Find Best View Counts for Each Metric ---
+best_f1_idx = summary_df['F1'].idxmax()
+best_precision_idx = summary_df['Precision'].idxmax()
+best_recall_idx = summary_df['Recall'].idxmax()
+
+best_f1 = summary_df.loc[best_f1_idx]
+best_precision = summary_df.loc[best_precision_idx]
+best_recall = summary_df.loc[best_recall_idx]
+
+print("\n🏆 Best Results by Metric:")
+print(f"Best F1-score     : {best_f1['F1']:.4f} at {int(best_f1['Views'])} views")
+print(f"Best Precision    : {best_precision['Precision']:.4f} at {int(best_precision['Views'])} views")
+print(f"Best Recall       : {best_recall['Recall']:.4f} at {int(best_recall['Views'])} views")
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+plt.figure(figsize=(10, 6))
+
+plt.plot(summary_df['Views'], summary_df['Precision'], label='Precision', marker='o', markersize=6, linewidth=1.5)
+plt.plot(summary_df['Views'], summary_df['Recall'], label='Recall', marker='s', markersize=6, linewidth=1.5)
+plt.plot(summary_df['Views'], summary_df['F1'], label='F1-score', marker='^', markersize=6, linewidth=1.5)
+
+plt.title('Phishing Detection Metrics vs Number of Views (Zoomed In)')
+plt.xlabel('Number of Views')
+plt.ylabel('Score')
+
+plt.ylim(0.65, 0.9)
+plt.yticks(np.linspace(0.65, 0.9, 10))  # ← 10 evenly spaced ticks
+plt.xticks(summary_df['Views'])         # ← Show all view counts on x-axis
+
+plt.grid(True, which='both', linestyle='--', alpha=0.6)
+plt.legend()
+plt.tight_layout()
+plt.savefig("phishing_metrics_zoomed.png", dpi=300)
+plt.show()
+
+
+
+
+
