@@ -1,0 +1,14 @@
+Best Hyperparameters:
+Threshold: 
+Bloom Size: 6144
+Num Hashes: 1
+Num Views: 55
+lambda_lasso: 5.0e-04
+prob_p: 0.30000000000000004
+prob_q: 0.95
+prob_f: 0.4
+
+Performance:
+Precision: 0.3613
+Recall: 0.5212
+F1 Score: 0.4268
